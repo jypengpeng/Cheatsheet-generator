@@ -1,0 +1,5 @@
+{
+  "name": "Markdown Page Fitter",
+  "description": "An intelligent text formatting tool that adjusts font size to fit your Markdown content perfectly within two pages, ensuring a clean and professional layout for printing or sharing.",
+  "requestFramePermissions": []
+}
