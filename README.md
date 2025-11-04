@@ -1,20 +1,60 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Cheatsheet Generator (智能Markdown排版工具)
 
-# Run and deploy your AI Studio app
+一个智能的 Markdown 到 A4 格式的排版工具。本应用能够自动调整布局、分栏和字体大小，将您的内容完美地适配到可打印的 A4 页面上，是创建专业速查表、内容摘要和学习笔记的理想选择。
 
-This contains everything you need to run your app locally.
+## 功能特性
 
-View your app in AI Studio: https://ai.studio/apps/drive/1Frj_3hw1MljjCsJT5uLvZvZBPlrRkixM
+-   **智能自动排版**: 自动寻找最佳的分栏数量和字体大小组合，以两页为初始目标，将内容完美填充。
+-   **实时 A4 预览**: 即时预览您的 Markdown 内容在 A4 页面上的最终效果。
+-   **动态分页**: 当您调整内容或字体大小时，预览区域会自动增加或减少页面，真实反映文档长度。
+-   **字体大小微调**: 手动增大或减小字体大小，以达到最佳的可读性和信息密度。
+-   **多栏布局支持**: 可生成 1 至 4 栏的布局，轻松创建信息密集的速查表。
+-   **打印友好**: 一键调用浏览器的打印功能，精确地将屏幕上的预览效果打印成纸质文档。
+-   **完整的 Markdown 支持**: 安全地渲染所有标准的 Markdown 语法，包括标题、列表、代码块、表格等。
+-   **零配置运行**: 使用现代浏览器的 `importmap` 特性直接加载依赖，无需 `npm install` 或任何构建步骤。
 
-## Run Locally
+## 如何使用
 
-**Prerequisites:**  Node.js
+用户界面设计得非常简洁直观。
 
+1.  **输入内容**: 在左侧的编辑器中粘贴或编写您的 Markdown 文本。
+2.  **生成排版**: 点击 **"智能排版"** 按钮。应用将处理您的文本并寻找最佳布局方案。
+3.  **审阅预览**: 格式化后的 A4 页面将显示在右侧的预览区域。标题栏会显示总页数和使用的分栏数（例如，`2页 / 4栏`）。
+4.  **微调（可选）**: 使用预览上方的 `+` 和 `-` 按钮调整字体大小。预览会即时更新以反映您的更改。
+5.  **打印**: 当您对布局满意后，点击 **"打印"** 按钮来打开浏览器的打印对话框，并打印最终的文档。
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## 如何部署 / 本地运行
+
+本项目是一个静态 Web 应用，不需要复杂的构建过程。您只需要一个简单的本地 Web 服务器来托管这些文件即可。
+
+#### 先决条件
+
+-   一个现代网页浏览器（如 Chrome, Firefox, Edge）。
+-   一个本地 Web 服务器。如果您安装了 Python 或 Node.js，您就已经拥有了所需的工具。
+
+#### 运行步骤
+
+1.  **获取文件**: 下载或克隆所有的项目文件（`index.html`, `index.tsx`, `App.tsx`, `metadata.json`）到您电脑上的同一个文件夹中。
+
+2.  **启动 Web 服务器**: 打开您的终端或命令提示符，进入项目所在的文件夹，然后运行以下命令之一：
+
+    -   **如果您安装了 Python 3:**
+        ```bash
+        python -m http.server
+        ```
+
+    -   **如果您安装了 Node.js:**
+        ```bash
+        npx serve
+        ```
+        (如果您的系统中没有 `serve`，它会提示您安装。只需输入 `y` 并按回车键即可)。
+
+3.  **在浏览器中打开**: 终端会输出一个本地访问地址，通常是 `http://localhost:8000` (Python) 或 `http://localhost:3000` (`serve`)。在您的浏览器中打开这个地址，即可开始使用本应用。
+
+## 技术栈
+
+-   **前端**: React 19, TypeScript
+-   **样式**: Tailwind CSS (通过 CDN)
+-   **Markdown 解析**: [marked](https://marked.js.org/)
+-   **HTML 清理**: [DOMPurify](https://github.com/cure53/DOMPurify)
+-   **模块加载**: 所有依赖通过 `index.html` 中的 `importmap` 在浏览器端直接加载。
