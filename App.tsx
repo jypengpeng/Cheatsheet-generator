@@ -7,13 +7,26 @@ const A4_ASPECT_RATIO = 297 / 210;
 const PAGE_WIDTH_PT = 595; // Standard A4 width in points (72dpi)
 const PAGE_HEIGHT_PT = PAGE_WIDTH_PT * A4_ASPECT_RATIO;
 const PAGE_PADDING_PT = 40; // 40pt padding
-const COLUMN_GAP_PX = 10; // Space between columns
+const COLUMN_GAP_PT = 10; // Space between columns (pt)
 
 const MAX_FONT_SIZE = 16;
 const MIN_FONT_SIZE = 2;
 const FONT_STEP = 0.1;
 
 const COLUMN_HEIGHT_PT = PAGE_HEIGHT_PT - (PAGE_PADDING_PT * 2);
+const PT_TO_PX = 96 / 72; // CSS 1pt = 1/72in, 1px = 1/96in
+const ptToPx = (pt: number) => pt * PT_TO_PX;
+
+// px 派生尺寸：确保屏幕预览与打印一致（打印也按 96DPI 渲染 px）
+const PAGE_WIDTH_PX = ptToPx(PAGE_WIDTH_PT);
+const PAGE_HEIGHT_PX = ptToPx(PAGE_HEIGHT_PT);
+const PAGE_PADDING_PX = ptToPx(PAGE_PADDING_PT);
+const COLUMN_GAP_PX = ptToPx(COLUMN_GAP_PT);
+const COLUMN_HEIGHT_PX = ptToPx(COLUMN_HEIGHT_PT);
+
+// 高 DPI 导出参数
+const EXPORT_DPI = 300; // 240~300 DPI 皆可，这里默认 300DPI
+const EXPORT_IMAGE_QUALITY = 0.92; // JPEG 质量（0~1）
 
 const DEFAULT_MARKDOWN = `# Markdown 页面适配器 (自动布局版)
 
@@ -70,6 +83,7 @@ const App: React.FC = () => {
     const [totalPages, setTotalPages] = useState<number>(2);
     const [isLoading, setIsLoading] = useState<boolean>(false);
     const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+    const [columnOption, setColumnOption] = useState<'auto' | '1' | '2' | '3' | '4'>('auto');
     
     const measurementRef = useRef<HTMLDivElement>(null);
 
@@ -84,18 +98,19 @@ const App: React.FC = () => {
 
             const container = measurementRef.current;
             container.innerHTML = formattedHtml;
-            const currentColumnWidth = (PAGE_WIDTH_PT - (PAGE_PADDING_PT * 2) - (COLUMN_GAP_PX * (finalNumColumns - 1))) / finalNumColumns;
+            const currentColumnWidthPt = (PAGE_WIDTH_PT - (PAGE_PADDING_PT * 2) - (COLUMN_GAP_PT * (finalNumColumns - 1))) / finalNumColumns;
+            const currentColumnWidthPx = ptToPx(currentColumnWidthPt);
             
-            container.style.width = `${currentColumnWidth}px`;
+            container.style.width = `${currentColumnWidthPx}px`;
             container.style.fontSize = `${finalFontSize}pt`;
             
             await new Promise(resolve => requestAnimationFrame(resolve)); // Let browser render
 
-            const totalContentHeight = container.scrollHeight;
+            const totalContentHeightPx = container.scrollHeight;
             const totalColumnsPerPage = finalNumColumns;
-            const heightPerColumn = COLUMN_HEIGHT_PT;
+            const heightPerColumnPx = COLUMN_HEIGHT_PX;
             
-            const totalColumnUnits = Math.ceil(totalContentHeight / heightPerColumn);
+            const totalColumnUnits = Math.ceil(totalContentHeightPx / heightPerColumnPx);
             const numPages = Math.ceil(totalColumnUnits / totalColumnsPerPage);
 
             setTotalPages(numPages > 0 ? numPages : 1);
@@ -128,12 +143,13 @@ const App: React.FC = () => {
         const cleanHtml = DOMPurify.sanitize(unsafeHtml);
         container.innerHTML = cleanHtml;
 
-        // Outer loop for columns (4 -> 1), prioritizing more columns
-        for (let numCols = 4; numCols >= 1; numCols--) {
-            const currentColumnWidth = (PAGE_WIDTH_PT - (PAGE_PADDING_PT * 2) - (COLUMN_GAP_PX * (numCols - 1))) / numCols;
-            // The initial target height is for 2 pages
-            const totalAvailableHeight = COLUMN_HEIGHT_PT * 2 * numCols;
-            container.style.width = `${currentColumnWidth}px`;
+        // Determine columns to try: auto (4 -> 1) or user-selected fixed column count
+        const columnsToTry = columnOption === 'auto' ? [4, 3, 2, 1] : [parseInt(columnOption, 10)];
+        for (const numCols of columnsToTry) {
+            const currentColumnWidthPt = (PAGE_WIDTH_PT - (PAGE_PADDING_PT * 2) - (COLUMN_GAP_PT * (numCols - 1))) / numCols;
+            // 两页高度阈值（px）
+            const totalAvailableHeightPx = COLUMN_HEIGHT_PX * 2 * numCols;
+            container.style.width = `${ptToPx(currentColumnWidthPt)}px`;
 
             // Inner loop for font size (MAX -> MIN)
             for (let fontSize = MAX_FONT_SIZE; fontSize >= MIN_FONT_SIZE; fontSize -= FONT_STEP) {
@@ -141,7 +157,7 @@ const App: React.FC = () => {
                 
                 await new Promise(resolve => requestAnimationFrame(resolve));
 
-                if (container.scrollHeight <= totalAvailableHeight) {
+                if (container.scrollHeight <= totalAvailableHeightPx) {
                     setFormattedHtml(cleanHtml);
                     setFinalFontSize(fontSize);
                     setFinalNumColumns(numCols);
@@ -156,7 +172,10 @@ const App: React.FC = () => {
         }
 
         if (!foundFit) {
-            setStatusMessage({ type: 'error', text: '内容太多，即使在最小字号和1栏布局下也无法排入两页。请删减部分内容。' });
+            const chosenCols = columnOption === 'auto' ? null : parseInt(columnOption, 10);
+            setStatusMessage({ type: 'error', text: chosenCols
+                ? `内容太多，即使在最小字号和所选 ${chosenCols} 栏布局下也无法排入两页。请删减部分内容或选择更多分栏数。`
+                : '内容太多，即使在最小字号和1栏布局下也无法排入两页。请删减部分内容。' });
             setFormattedHtml('');
             setFinalFontSize(null);
             setFinalNumColumns(2);
@@ -164,82 +183,90 @@ const App: React.FC = () => {
 
         container.innerHTML = '';
         setIsLoading(false);
-    }, [markdown]);
+    }, [markdown, columnOption]);
 
-    const handlePrint = () => {
+    // When column option changes, only update column count; keep current font size.
+    useEffect(() => {
+        if (!formattedHtml) return;
+        if (columnOption === 'auto') return; // Auto layout only when clicking "智能排版"
+        const chosenCols = parseInt(columnOption, 10);
+        if (Number.isFinite(chosenCols)) {
+            setFinalNumColumns(chosenCols);
+        }
+    }, [columnOption, formattedHtml]);
+
+    // 动态加载 html2canvas
+    const ensureHtml2Canvas = async (): Promise<any> => {
+        const anyWin = window as any;
+        if (anyWin.html2canvas) return anyWin.html2canvas;
+        await new Promise<void>((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js';
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error('Failed to load html2canvas'));
+            document.head.appendChild(script);
+        });
+        return (window as any).html2canvas;
+    };
+
+    const handlePrint = async () => {
         if (!formattedHtml || !finalFontSize || !finalNumColumns) return;
-    
-        const pageMargin = PAGE_PADDING_PT;
-        const printablePageWidth = PAGE_WIDTH_PT - (pageMargin * 2);
-    
-        const printStyles = `
-            @page {
-                size: A4;
-                margin: ${pageMargin}pt;
+        setIsLoading(true);
+        try {
+            const html2canvas = await ensureHtml2Canvas();
+            const pageNodes = Array.from(document.querySelectorAll('.preview-page')) as HTMLElement[];
+            if (pageNodes.length === 0) return;
+
+            const scale = EXPORT_DPI / 96; // 提升到目标 DPI
+            const images: string[] = [];
+
+            for (const pageEl of pageNodes) {
+                const prevShadow = pageEl.style.boxShadow;
+                pageEl.style.boxShadow = 'none';
+                const canvas: HTMLCanvasElement = await html2canvas(pageEl, {
+                    backgroundColor: '#ffffff',
+                    width: PAGE_WIDTH_PX,
+                    height: PAGE_HEIGHT_PX,
+                    scale,
+                    useCORS: true,
+                    allowTaint: true
+                });
+                pageEl.style.boxShadow = prevShadow;
+                const dataUrl = canvas.toDataURL('image/jpeg', EXPORT_IMAGE_QUALITY);
+                images.push(dataUrl);
             }
-    
-            html, body {
-                margin: 0;
-                padding: 0;
-                font-family: sans-serif;
-                -webkit-print-color-adjust: exact;
-                color-adjust: exact;
+
+            const styles = `
+                @page { size: A4; margin: 0; }
+                html, body { margin:0; padding:0; -webkit-print-color-adjust: exact; color-adjust: exact; }
+                .page { width:${PAGE_WIDTH_PX}px; height:${PAGE_HEIGHT_PX}px; page-break-after: always; }
+                .page img { width:100%; height:100%; object-fit: contain; }
+            `;
+
+            const html = `
+                <html>
+                    <head>
+                        <title>Print</title>
+                        <style>${styles}</style>
+                    </head>
+                    <body>
+                        ${images.map(src => `<div class=\"page\"><img src=\"${src}\"/></div>`).join('')}
+                    </body>
+                </html>
+            `;
+
+            const printWindow = window.open('', '_blank');
+            if (printWindow) {
+                printWindow.document.write(html);
+                printWindow.document.close();
+                const doPrint = () => {
+                    try { printWindow.focus(); printWindow.print(); } catch (e) { console.error('Printing failed:', e); }
+                };
+                printWindow.addEventListener('afterprint', () => printWindow.close());
+                setTimeout(doPrint, 600);
             }
-    
-            #print-content-wrapper {
-                width: ${printablePageWidth}pt;
-                column-count: ${finalNumColumns};
-                column-gap: ${COLUMN_GAP_PX}px;
-                column-fill: auto; /* Fill columns sequentially, allowing page breaks */
-                
-                /* Apply content styling */
-                font-size: ${finalFontSize}pt;
-                line-height: 1.6;
-            }
-            
-            #print-content-wrapper h1, #print-content-wrapper h2, #print-content-wrapper h3, #print-content-wrapper h4, #print-content-wrapper h5, #print-content-wrapper h6 { color: #1e293b; break-after: avoid-page; }
-            #print-content-wrapper p, #print-content-wrapper li { color: #334155; }
-            #print-content-wrapper a { color: #2563eb; text-decoration: none; }
-            #print-content-wrapper blockquote { border-left-color: #94a3b8; color: #475569; border-left-width: 4px; padding-left: 1em; margin-inline-start: 0; margin-inline-end: 0; }
-            #print-content-wrapper code { color: #e11d48; background-color: #f8fafc; padding: 0.1em 0.3em; border-radius: 4px; }
-            #print-content-wrapper pre { background-color: #f1f5f9; padding: 1em; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; }
-            #print-content-wrapper ul, #print-content-wrapper ol { padding-inline-start: 2em; }
-            #print-content-wrapper table { border-collapse: collapse; width: 100%; break-inside: avoid; }
-            #print-content-wrapper th, #print-content-wrapper td { border: 1px solid #cbd5e1; padding: 0.5em; }
-            #print-content-wrapper th { background-color: #f1f5f9; }
-        `;
-    
-        const printContent = `
-            <html>
-                <head>
-                    <title>Print</title>
-                    <style>${printStyles}</style>
-                </head>
-                <body>
-                    <div id="print-content-wrapper">
-                        ${formattedHtml}
-                    </div>
-                </body>
-            </html>
-        `;
-    
-        const printWindow = window.open('', '_blank');
-        if (printWindow) {
-            printWindow.document.write(printContent);
-            printWindow.document.close();
-    
-            const doPrint = () => {
-                try {
-                    printWindow.focus();
-                    printWindow.print();
-                } catch (e) {
-                    console.error("Printing failed:", e);
-                }
-            };
-    
-            printWindow.addEventListener('afterprint', () => printWindow.close());
-    
-            setTimeout(doPrint, 500); 
+        } finally {
+            setIsLoading(false);
         }
     };
 
@@ -253,8 +280,8 @@ const App: React.FC = () => {
     };
 
 
-    // Calculate column-dependent values for rendering
-    const columnWidth = (PAGE_WIDTH_PT - (PAGE_PADDING_PT * 2) - (COLUMN_GAP_PX * (finalNumColumns - 1))) / finalNumColumns;
+    // Calculate column-dependent values for rendering (px)
+    const columnWidth = (PAGE_WIDTH_PX - (PAGE_PADDING_PX * 2) - (COLUMN_GAP_PX * (finalNumColumns - 1))) / finalNumColumns;
 
     return (
         <div className="bg-slate-100 min-h-screen font-sans text-slate-800">
@@ -333,6 +360,20 @@ const App: React.FC = () => {
                         <div className="w-full flex justify-between items-center mb-4 no-print">
                             <h2 className="text-lg font-semibold">{`排版预览 (${totalPages}页 / ${finalNumColumns}栏)`}</h2>
                              <div className="flex items-center gap-2">
+                                <span className="text-sm text-slate-500">分栏:</span>
+                                <select
+                                    value={columnOption}
+                                    onChange={(e) => setColumnOption(e.target.value as 'auto' | '1' | '2' | '3' | '4')}
+                                    className="text-sm border border-slate-300 rounded-md px-2 py-1 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    aria-label="选择分栏数"
+                                >
+                                    <option value="auto">自动</option>
+                                    <option value="1">1栏</option>
+                                    <option value="2">2栏</option>
+                                    <option value="3">3栏</option>
+                                    <option value="4">4栏</option>
+                                </select>
+                                <div className="w-px h-6 bg-slate-200 mx-2"></div>
                                 <span className="text-sm text-slate-500">字号:</span>
                                 <button
                                     onClick={() => adjustFontSize(-FONT_STEP)}
@@ -361,18 +402,18 @@ const App: React.FC = () => {
                         </div>
                         
                         {/* Screen-only Preview */}
-                        <div className="no-print flex flex-col items-center gap-4">
+                                <div className="no-print flex flex-col items-center gap-4">
                             {Array.from({ length: totalPages }).map((_, pageIndex) => (
-                                <div key={pageIndex} className="bg-white shadow-xl" style={{width: `${PAGE_WIDTH_PT}px`, height: `${PAGE_HEIGHT_PT}px`}}>
-                                    <div className="h-full flex" style={{padding: `${PAGE_PADDING_PT}px`, gap: `${COLUMN_GAP_PX}px`}}>
+                                <div key={pageIndex} className="bg-white shadow-xl preview-page" style={{width: `${PAGE_WIDTH_PX}px`, height: `${PAGE_HEIGHT_PX}px`}}>
+                                    <div className="h-full flex" style={{padding: `${PAGE_PADDING_PX}px`, gap: `${COLUMN_GAP_PX}px`}}>
                                         {Array.from({ length: finalNumColumns }).map((_, colIndex) => {
                                             const overallColumnIndex = pageIndex * finalNumColumns + colIndex;
-                                            const translateY = -COLUMN_HEIGHT_PT * overallColumnIndex;
+                                            const translateY = -COLUMN_HEIGHT_PX * overallColumnIndex;
                                             
                                             if (!formattedHtml && overallColumnIndex > 0) return <div key={colIndex} style={{width: `${columnWidth}px`}}/>;
 
                                             return (
-                                                <div key={colIndex} style={{width: `${columnWidth}px`, height: `${COLUMN_HEIGHT_PT}px`, overflow: 'hidden'}}>
+                                                <div key={colIndex} style={{width: `${columnWidth}px`, height: `${COLUMN_HEIGHT_PX}px`, overflow: 'hidden'}}>
                                                     <div
                                                         className="prose-styles"
                                                         style={{
