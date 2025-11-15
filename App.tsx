@@ -1,6 +1,14 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
+// @ts-ignore
+import JSZip from 'jszip';
+// @ts-ignore
+import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist';
+// @ts-ignore
+import pdfjsWorkerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+// @ts-ignore
+import * as mammoth from 'mammoth';
 
 // --- Constants ---
 const A4_ASPECT_RATIO = 297 / 210;
@@ -84,6 +92,26 @@ const App: React.FC = () => {
     const [isLoading, setIsLoading] = useState<boolean>(false);
     const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
     const [columnOption, setColumnOption] = useState<'auto' | '1' | '2' | '3' | '4'>('auto');
+
+    // --- AI Integration States ---
+    const [aiBaseUrl, setAiBaseUrl] = useState<string>(() => localStorage.getItem('ai_base_url') || 'https://api.openai.com');
+    const [aiApiKey, setAiApiKey] = useState<string>(() => localStorage.getItem('ai_api_key') || '');
+    const [aiModels, setAiModels] = useState<string[]>(() => {
+        try {
+            const raw = localStorage.getItem('ai_models');
+            return raw ? JSON.parse(raw) as string[] : [];
+        } catch {
+            return [];
+        }
+    });
+    const [aiSelectedModel, setAiSelectedModel] = useState<string>(() => localStorage.getItem('ai_model') || '');
+    const [aiConnecting, setAiConnecting] = useState<boolean>(false);
+    const [aiConnected, setAiConnected] = useState<boolean>(false);
+    const [aiSourceText, setAiSourceText] = useState<string>('');
+    const [aiFiles, setAiFiles] = useState<File[]>([]);
+    const [aiGenerating, setAiGenerating] = useState<boolean>(false);
+    const [aiMessage, setAiMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
+    const [aiGenSuccess, setAiGenSuccess] = useState<boolean>(false);
     
     const measurementRef = useRef<HTMLDivElement>(null);
 
@@ -121,6 +149,343 @@ const App: React.FC = () => {
         calculatePages();
     }, [formattedHtml, finalFontSize, finalNumColumns]);
 
+    // Persist AI settings
+    useEffect(() => {
+        localStorage.setItem('ai_base_url', aiBaseUrl);
+    }, [aiBaseUrl]);
+    useEffect(() => {
+        localStorage.setItem('ai_api_key', aiApiKey);
+    }, [aiApiKey]);
+    useEffect(() => {
+        localStorage.setItem('ai_model', aiSelectedModel);
+    }, [aiSelectedModel]);
+    useEffect(() => {
+        try {
+            localStorage.setItem('ai_models', JSON.stringify(aiModels));
+        } catch {}
+    }, [aiModels]);
+
+    // Ensure pdf.js worker
+    const ensurePdfWorker = useCallback(() => {
+        try {
+            if ((GlobalWorkerOptions as any).workerSrc !== pdfjsWorkerSrc) {
+                GlobalWorkerOptions.workerSrc = pdfjsWorkerSrc as unknown as string;
+            }
+        } catch {
+            // ignore
+        }
+    }, []);
+
+    // Extract text from PDF
+    const extractTextFromPdf = useCallback(async (file: File): Promise<string> => {
+        ensurePdfWorker();
+        const url = URL.createObjectURL(file);
+        try {
+            const task = getDocument({ url });
+            const pdf = await task.promise;
+            const numPages = pdf.numPages;
+            const chunks: string[] = [];
+            for (let i = 1; i <= numPages; i++) {
+                const page = await pdf.getPage(i);
+                const content = await page.getTextContent();
+                const text = (content.items as any[]).map((it: any) => (it?.str ?? '')).join(' ');
+                chunks.push(text);
+            }
+            return chunks.join('\n\n');
+        } finally {
+            URL.revokeObjectURL(url);
+        }
+    }, [ensurePdfWorker]);
+
+    // Extract text from uploaded files（本地解析，包括 PDF/DOCX/PPTX）
+    const extractTextFromFiles = useCallback(async (files: File[]): Promise<{ text: string; warnings: string[] }> => {
+        const warnings: string[] = [];
+        const texts: string[] = [];
+        for (const f of files) {
+            const ext = f.name.split('.').pop()?.toLowerCase() || '';
+            if (ext === 'txt' || ext === 'md') {
+                try {
+                    const t = await f.text();
+                    const label = ext === 'txt' ? 'TXT' : 'Markdown';
+                    texts.push(`# 文件：${f.name}（类型：${label}，本地解析）\n\n${t}`);
+                } catch (e) {
+                    warnings.push(`读取失败：${f.name}`);
+                }
+            } else if (ext === 'pdf') {
+                try {
+                    const t = await extractTextFromPdf(f);
+                    texts.push(`# 文件：${f.name}（类型：PDF，本地解析，可能存在格式/布局丢失）\n\n${t}`);
+                } catch (e) {
+                    warnings.push(`PDF 解析失败：${f.name}`);
+                }
+            } else if (ext === 'docx') {
+                try {
+                    const t = await extractTextFromDocx(f);
+                    texts.push(`# 文件：${f.name}（类型：DOCX，本地解析：mammoth）\n\n${t}`);
+                } catch (e) {
+                    warnings.push(`DOCX 解析失败：${f.name}`);
+                }
+            } else if (ext === 'pptx') {
+                try {
+                    const t = await extractTextFromPptx(f);
+                    texts.push(`# 文件：${f.name}（类型：PPTX，本地解析：XML 文本提取）\n\n${t}`);
+                } catch (e) {
+                    warnings.push(`PPTX 解析失败：${f.name}`);
+                }
+            } else {
+                warnings.push(`不支持的文件类型：${f.name}`);
+            }
+        }
+        return { text: texts.join('\n\n---\n\n'), warnings };
+    }, [extractTextFromPdf]);
+
+    // DOCX -> Markdown（mammoth）
+    const extractTextFromDocx = useCallback(async (file: File): Promise<string> => {
+        const ab = await file.arrayBuffer();
+        try {
+            if (typeof (mammoth as any).convertToMarkdown === 'function') {
+                const result = await (mammoth as any).convertToMarkdown({ arrayBuffer: ab });
+                const md = (result?.value ?? '').toString();
+                if (md.trim()) return md;
+            }
+            // fallback: HTML -> plaintext
+            const htmlRes = await (mammoth as any).convertToHtml({ arrayBuffer: ab });
+            const html = (htmlRes?.value ?? '').toString();
+            const tmp = document.createElement('div');
+            tmp.innerHTML = html;
+            return tmp.textContent || tmp.innerText || '';
+        } catch (e) {
+            throw e;
+        }
+    }, []);
+
+    // PPTX -> 逐页提取 a:t 文本
+    const extractTextFromPptx = useCallback(async (file: File): Promise<string> => {
+        const ab = await file.arrayBuffer();
+        const zip = await JSZip.loadAsync(ab);
+        const slideFiles = Object.keys(zip.files)
+            .filter(n => n.startsWith('ppt/slides/slide') && n.endsWith('.xml'))
+            .sort((a, b) => {
+                const ai = parseInt(a.match(/slide(\d+)\.xml$/)?.[1] || '0', 10);
+                const bi = parseInt(b.match(/slide(\d+)\.xml$/)?.[1] || '0', 10);
+                return ai - bi;
+            });
+        const slidesMarkdown: string[] = [];
+        for (let idx = 0; idx < slideFiles.length; idx++) {
+            const name = slideFiles[idx];
+            const xml = await zip.file(name)!.async('text');
+            const doc = new DOMParser().parseFromString(xml, 'application/xml');
+            const tNodes = Array.from(doc.getElementsByTagName('a:t'));
+            const texts = tNodes.map(n => (n.textContent || '').trim()).filter(s => s.length > 0);
+            if (texts.length === 0) continue;
+            const items = texts.map(s => `- ${s}`).join('\n');
+            slidesMarkdown.push(`## 幻灯片 ${idx + 1}\n${items}`);
+        }
+        return slidesMarkdown.join('\n\n');
+    }, []);
+
+    // --- API URL 兼容（自动规避重复 /v1） ---
+    const buildApiUrl = useCallback((baseUrl: string, endpointPath: string): string => {
+        const root = baseUrl
+            .trim()
+            .replace(/\/+$/, '')
+            .replace(/\/v1$/i, '');
+        const path = endpointPath.startsWith('/') ? endpointPath : `/${endpointPath}`;
+        return `${root}${path}`;
+    }, []);
+
+    const handleFilesChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const fl = Array.from(e.target.files || []) as File[];
+        setAiFiles(fl);
+        if (fl.length === 0) return;
+        setAiMessage({ type: 'info', text: '正在提取文件文本...' });
+        const { text, warnings } = await extractTextFromFiles(fl);
+        setAiSourceText(prev => {
+            const base = prev?.trim() ? (prev.trim() + '\n\n---\n\n') : '';
+            return base + text;
+        });
+        if (warnings.length > 0) {
+            setAiMessage({ type: 'error', text: warnings.join('；') });
+        } else {
+            setAiMessage({ type: 'success', text: '文件文本提取完成。' });
+        }
+    }, [extractTextFromFiles]);
+
+    // Connect & fetch models
+    const fetchModels = useCallback(async (baseUrl: string, apiKey: string): Promise<string[]> => {
+        const url = buildApiUrl(baseUrl, '/v1/models');
+        const resp = await fetch(url, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${apiKey}`
+            }
+        });
+        if (!resp.ok) {
+            throw new Error(`获取模型失败：${resp.status} ${resp.statusText}`);
+        }
+        const data = await resp.json();
+        const ids: string[] = Array.isArray(data?.data) ? data.data.map((m: any) => m?.id).filter(Boolean) : [];
+        return ids;
+    }, [buildApiUrl]);
+
+    const handleConnect = useCallback(async () => {
+        if (!aiApiKey.trim()) {
+            setAiMessage({ type: 'error', text: '请填写 API Key。' });
+            return;
+        }
+        setAiConnecting(true);
+        setAiMessage(null);
+        try {
+            const ids = await fetchModels(aiBaseUrl, aiApiKey);
+            const sorted = ids.slice().sort();
+            const fallback = ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini', 'gpt-4.1', 'o4-mini', 'gpt-3.5-turbo'];
+            const finalModels = sorted.length > 0 ? sorted : fallback;
+            setAiModels(finalModels);
+            const preferred = ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini', 'o4-mini', 'gpt-3.5-turbo'];
+            const picked = preferred.find(m => finalModels.includes(m)) || finalModels[0] || '';
+            setAiSelectedModel(picked);
+            setAiConnected(true);
+            setAiMessage({ type: 'success', text: '连接成功，已加载模型列表。' });
+        } catch (e: any) {
+            const fallback = ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini', 'o4-mini', 'gpt-3.5-turbo'];
+            setAiModels(fallback);
+            setAiSelectedModel(fallback[0]);
+            setAiConnected(false);
+            setAiMessage({ type: 'error', text: `连接失败：${e?.message || e}` });
+        } finally {
+            setAiConnecting(false);
+        }
+    }, [aiApiKey, aiBaseUrl, fetchModels]);
+
+    // OpenAI Chat Completions call
+    const callChatCompletions = useCallback(async (params: {
+        baseUrl: string;
+        apiKey: string;
+        model: string;
+        messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
+        temperature?: number;
+    }): Promise<string> => {
+        const url = buildApiUrl(params.baseUrl, '/v1/chat/completions');
+        const resp = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${params.apiKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                model: params.model,
+                temperature: params.temperature ?? 0.2,
+                messages: params.messages
+            })
+        });
+        if (!resp.ok) {
+            let msg = `${resp.status} ${resp.statusText}`;
+            try {
+                const errData = await resp.json();
+                if (errData?.error?.message) msg = errData.error.message;
+            } catch {}
+            throw new Error(`调用模型失败：${msg}`);
+        }
+        const data = await resp.json();
+        const content = data?.choices?.[0]?.message?.content;
+        if (typeof content === 'string') return content;
+        if (Array.isArray(content)) {
+            const merged = content.map((p: any) => (p?.text ?? '')).join('');
+            return merged;
+        }
+        return '';
+    }, [buildApiUrl]);
+
+    // （移除远端文件上传路径，保持本地解析逻辑）
+    // Chunk helper
+    const chunkText = (text: string, chunkSize: number): string[] => {
+        const chunks: string[] = [];
+        for (let i = 0; i < text.length; i += chunkSize) {
+            chunks.push(text.slice(i, i + chunkSize));
+        }
+        return chunks;
+    };
+
+    const generateKnowledgeMarkdown = useCallback(async () => {
+        const src = aiSourceText.trim();
+        if (!src) {
+            setAiMessage({ type: 'error', text: '请输入文本或上传文件。' });
+            return;
+        }
+        if (!aiApiKey.trim() || !aiSelectedModel.trim()) {
+            setAiMessage({ type: 'error', text: '请先填写 Key 并连接选择模型。' });
+            return;
+        }
+        setAiGenerating(true);
+        setAiGenSuccess(false);
+        setAiMessage({ type: 'info', text: '正在生成知识点 Markdown...' });
+        try {
+            const basePrompt = '你是一个严谨的中文助教。请从提供的材料（如课件、考试题）中提炼结构化知识点，要求：1) 主题-子主题层次清晰；2) 关键概念、定义、公式/代码、例题要点、易错点与对比；3) 给出适合速记的条目化要点；4) 输出严格使用中文 Markdown，以 # / ## / ### 标题组织，列表为 - 项，必要时用代码块与公式块；5) 末尾给出简短总结与复习建议；6) 禁止客套或模型自述。';
+            const fileTypeLabel: Record<string, string> = { pdf: 'PDF', docx: 'DOCX', pptx: 'PPTX', md: 'Markdown', txt: 'TXT' };
+            const typesIncluded = Array.from(new Set(aiFiles
+                .map(f => (f.name.split('.').pop()?.toLowerCase() || ''))
+                .filter(Boolean)
+                .map(ext => fileTypeLabel[ext] || ext.toUpperCase())));
+            const sourceNote = typesIncluded.length > 0
+                ? `注意：本次材料来自本地解析（包含：${typesIncluded.join(', ')}），可能存在格式/布局/公式渲染等细节丢失或换行错乱。请在总结时尽量修复明显格式问题，并对不确定处标注“可能不完整”。`
+                : `注意：材料主要来自纯文本输入。`;
+            const SYSTEM_PROMPT = `${basePrompt}\n\n${sourceNote}`;
+
+            const MAX_CHARS = 120000; // 简易阈值（按字符近似token）
+            let finalMd = '';
+            if (src.length <= MAX_CHARS) {
+                finalMd = await callChatCompletions({
+                    baseUrl: aiBaseUrl,
+                    apiKey: aiApiKey,
+                    model: aiSelectedModel,
+                    messages: [
+                        { role: 'system', content: SYSTEM_PROMPT },
+                        { role: 'user', content: src }
+                    ],
+                    temperature: 0.2
+                });
+            } else {
+                const PART_SIZE = 60000;
+                const parts = chunkText(src, PART_SIZE);
+                const partSummaries: string[] = [];
+                for (let idx = 0; idx < parts.length; idx++) {
+                    const p = parts[idx];
+                    const md = await callChatCompletions({
+                        baseUrl: aiBaseUrl,
+                        apiKey: aiApiKey,
+                        model: aiSelectedModel,
+                        messages: [
+                            { role: 'system', content: SYSTEM_PROMPT + ' 请只对当前分片生成该分片的知识点笔记（Markdown）。' },
+                            { role: 'user', content: `分片 ${idx + 1}/${parts.length}\n\n${p}` }
+                        ],
+                        temperature: 0.2
+                    });
+                    partSummaries.push(`## 分片 ${idx + 1} 总结\n\n${md}`);
+                }
+                const mergedInput = partSummaries.join('\n\n---\n\n');
+                finalMd = await callChatCompletions({
+                    baseUrl: aiBaseUrl,
+                    apiKey: aiApiKey,
+                    model: aiSelectedModel,
+                    messages: [
+                        { role: 'system', content: SYSTEM_PROMPT + ' 将多份分片总结合并为一份完整、去重、结构清晰的最终笔记（Markdown）。' },
+                        { role: 'user', content: mergedInput }
+                    ],
+                    temperature: 0.2
+                });
+            }
+            if (!finalMd?.trim()) {
+                throw new Error('模型未返回内容。');
+            }
+            setMarkdown(finalMd.trim());
+            setAiGenSuccess(true);
+            setAiMessage({ type: 'success', text: '生成完成，内容已填入左侧编辑器。可点击“智能排版”。' });
+        } catch (e: any) {
+            setAiMessage({ type: 'error', text: e?.message || '生成失败' });
+        } finally {
+            setAiGenerating(false);
+        }
+    }, [aiSourceText, aiApiKey, aiSelectedModel, aiBaseUrl, callChatCompletions, aiFiles]);
 
     const handleFormat = useCallback(async () => {
         setIsLoading(true);
@@ -284,19 +649,19 @@ const App: React.FC = () => {
     const columnWidth = (PAGE_WIDTH_PX - (PAGE_PADDING_PX * 2) - (COLUMN_GAP_PX * (finalNumColumns - 1))) / finalNumColumns;
 
     return (
-        <div className="bg-slate-100 min-h-screen font-sans text-slate-800">
+        <div className="bg-neutral-50 min-h-screen font-sans text-black">
             <style>
                 {`
                 @media print {
                     body { margin: 0; padding: 0; }
                     .no-print { display: none !important; }
                 }
-                .prose-styles h1, .prose-styles h2, .prose-styles h3, .prose-styles h4, .prose-styles h5, .prose-styles h6 { color: #1e293b; }
-                .prose-styles p, .prose-styles li { color: #334155; }
-                .prose-styles a { color: #2563eb; }
-                .prose-styles blockquote { border-left-color: #94a3b8; color: #475569; border-left-width: 4px; padding-left: 1em;}
-                .prose-styles code { color: #e11d48; background-color: #f8fafc; padding: 0.1em 0.3em; border-radius: 4px; }
-                .prose-styles pre { background-color: #f1f5f9; padding: 1em; border-radius: 4px; }
+                .prose-styles h1, .prose-styles h2, .prose-styles h3, .prose-styles h4, .prose-styles h5, .prose-styles h6 { color: #000 !important; font-weight: 700 !important; }
+                .prose-styles p, .prose-styles li { color: #000 !important; }
+                .prose-styles a { color: #000 !important; text-decoration: underline !important; }
+                .prose-styles blockquote { border-left-color: rgba(0,0,0,0.25) !important; color: rgba(0,0,0,0.85) !important; border-left-width: 4px !important; padding-left: 1em !important; }
+                .prose-styles code { color: #000 !important; background-color: #f8fafc !important; padding: 0.1em 0.3em !important; border-radius: 2px !important; }
+                .prose-styles pre { background-color: #f5f5f5 !important; color: #000 !important; padding: 1em !important; border-radius: 2px !important; }
                 `}
             </style>
             
@@ -310,15 +675,129 @@ const App: React.FC = () => {
 
             <header className="bg-white shadow-sm p-4 no-print">
                 <div className="container mx-auto flex justify-between items-center">
-                    <h1 className="text-2xl font-bold text-slate-700">Markdown 页面适配器</h1>
+                    <h1 className="text-3xl font-bold text-black">一键cheat sheet生成器</h1>
                 </div>
             </header>
 
             <main className="container mx-auto p-4 md:p-8 grid grid-cols-1 lg:grid-cols-2 gap-8">
                 <div className="flex flex-col no-print">
-                    <div className="bg-white rounded-lg shadow-lg flex-grow flex flex-col">
-                        <div className="p-4 border-b border-slate-200">
-                            <h2 className="text-lg font-semibold">输入 Markdown 内容</h2>
+                    {/* AI 知识点总结卡片 */}
+                    <div className="bg-white rounded-sm shadow-md mb-6">
+                        <div className="p-4 border-b border-neutral-200 flex items-center justify-between">
+                            <h2 className="text-xl font-semibold text-black">AI 知识点总结（OpenAI）</h2>
+                        </div>
+                        <div className="p-4 flex flex-col gap-4">
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                                <div className="col-span-1 md:col-span-1">
+                                    <label className="block text-sm text-black/80 mb-1">Base URL</label>
+                                    <input
+                                        value={aiBaseUrl}
+                                        onChange={(e) => setAiBaseUrl(e.target.value)}
+                                        placeholder="https://api.openai.com"
+                                        className="w-full border border-neutral-300 rounded-sm px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-800 focus:border-neutral-800"
+                                    />
+                                </div>
+                                <div className="col-span-1 md:col-span-1">
+                                    <label className="block text-sm text-black/80 mb-1">API Key</label>
+                                    <input
+                                        value={aiApiKey}
+                                        onChange={(e) => setAiApiKey(e.target.value)}
+                                        placeholder="sk-..."
+                                        type="password"
+                                        className="w-full border border-neutral-300 rounded-sm px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-800 focus:border-neutral-800"
+                                    />
+                                </div>
+                                <div className="col-span-1 md:col-span-1 flex items-end gap-2">
+                                    <button
+                                        onClick={handleConnect}
+                                        disabled={aiConnecting || !aiApiKey.trim()}
+                                        className="bg-black text-white font-bold py-2 px-4 rounded-sm hover:bg-neutral-900 disabled:bg-neutral-400 disabled:cursor-not-allowed text-sm focus:outline-none focus:ring-2 focus:ring-neutral-800"
+                                    >
+                                        {aiConnecting ? '连接中...' : '连接并获取模型'}
+                                    </button>
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+                                <div className="col-span-1 md:col-span-2">
+                                    <label className="block text-sm text-black/80 mb-1">模型</label>
+                                    <select
+                                        value={aiSelectedModel}
+                                        onChange={(e) => setAiSelectedModel(e.target.value)}
+                                        className="w-full border border-neutral-300 rounded-sm px-2 py-1 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-neutral-800 focus:border-neutral-800"
+                                    >
+                                        <option value="" disabled>请选择模型</option>
+                                        {aiModels.map(m => (
+                                            <option key={m} value={m}>{m}</option>
+                                        ))}
+                                    </select>
+                                </div>
+                                <div className="col-span-1 md:col-span-1">
+                                    <div className={`text-sm ${aiConnected ? 'text-black' : 'text-black/60'}`}>
+                                        {aiConnected ? '已连接' : '未连接'}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm text-black/80 mb-1">源材料文本（可直接输入或与文件合并）</label>
+                                <textarea
+                                    value={aiSourceText}
+                                    onChange={(e) => setAiSourceText(e.target.value)}
+                                    className="w-full min-h-[160px] p-3 border border-neutral-300 rounded-sm text-sm leading-6 focus:outline-none focus:ring-2 focus:ring-neutral-800 focus:border-neutral-800"
+                                    placeholder="在此粘贴原始材料文本，或下方上传文件（txt/md/pdf/docx/pptx）"
+                                />
+                                <div className="mt-3 flex items-center gap-3">
+                                    <input
+                                        type="file"
+                                        multiple
+                                        accept=".txt,.md,.docx,.pptx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                                        onChange={handleFilesChange}
+                                        className="text-sm"
+                                    />
+                                    <span className="text-xs text-black/60">支持 txt、md、pdf、docx、pptx；多个文件将合并提取文本</span>
+                                </div>
+                                <div className="mt-2 text-xs text-black/70">
+                                    提示：当前所有文件均在本地解析后再发送给模型（包括 PDF/DOCX/PPTX），可能存在格式/公式/布局丢失或换行错乱。作者现在比较唐，不会写文件上传，有时间搞清楚了会添加的。
+                                </div>
+                            </div>
+
+                            {aiMessage && (
+                                <div className={`text-sm ${aiMessage.type === 'error' ? 'text-black' : aiMessage.type === 'success' ? 'text-black' : 'text-black/70'}`}>
+                                    {aiMessage.text}
+                                </div>
+                            )}
+
+                            <div className="flex justify-end">
+                                <button
+                                    onClick={generateKnowledgeMarkdown}
+                                    disabled={aiGenerating || !aiSelectedModel || !aiApiKey.trim()}
+                                    className="bg-black text-white font-bold py-2 px-6 rounded-sm hover:bg-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-800 focus:ring-offset-2 transition-colors duration-200 disabled:bg-neutral-400 disabled:cursor-not-allowed text-sm"
+                                >
+                                    {aiGenerating ? '生成中...' : '生成知识点 Markdown'}
+                                </button>
+                                {aiGenSuccess && (
+                                    <button
+                                        onClick={handleFormat}
+                                        disabled={isLoading}
+                                        className="ml-2 bg-black text-white font-bold py-2 px-6 rounded-sm hover:bg-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-800 focus:ring-offset-2 transition-colors duration-200 disabled:bg-neutral-400 disabled:cursor-not-allowed text-sm"
+                                    >
+                                        一键智能排版
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="bg-white rounded-sm shadow-md flex-grow flex flex-col">
+                        <div className="p-4 border-b border-neutral-200 flex items-center justify-between">
+                            <h2 className="text-xl font-semibold text-black">输入 Markdown 内容</h2>
+                            <button
+                                onClick={handleFormat}
+                                disabled={isLoading}
+                                className="bg-black text-white font-bold py-2 px-6 rounded-sm hover:bg-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-800 transition-colors duration-200 disabled:bg-neutral-400 disabled:cursor-not-allowed text-sm no-print"
+                            >
+                                一键智能排版
+                            </button>
                         </div>
                         <textarea
                             value={markdown}
@@ -327,9 +806,9 @@ const App: React.FC = () => {
                             placeholder="在此处输入或粘贴您的 Markdown..."
                             style={{minHeight: '60vh'}}
                         />
-                         <div className="p-4 border-t border-slate-200 flex items-center justify-between bg-slate-50 rounded-b-lg">
+                         <div className="p-4 border-t border-neutral-200 flex items-center justify-between bg-neutral-50 rounded-b-sm">
                             {statusMessage ? (
-                                <div className={`flex items-center text-sm ${statusMessage.type === 'success' ? 'text-green-600' : 'text-red-600'}`}>
+                                <div className={`flex items-center text-sm text-black`}>
                                     {statusMessage.type === 'success' ? 
                                         <CheckCircleIcon className="w-5 h-5 mr-2" /> : 
                                         <ExclamationTriangleIcon className="w-5 h-5 mr-2" />
@@ -337,34 +816,20 @@ const App: React.FC = () => {
                                     <span>{statusMessage.text}</span>
                                 </div>
                             ) : <div/> /* Placeholder to keep layout consistent */}
-                            <button
-                                onClick={handleFormat}
-                                disabled={isLoading}
-                                className="ml-auto bg-blue-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors duration-200 disabled:bg-slate-400 disabled:cursor-not-allowed flex items-center"
-                            >
-                                {isLoading ? (
-                                    <>
-                                        <SpinnerIcon className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" />
-                                        处理中...
-                                    </>
-                                ) : (
-                                    '智能排版'
-                                )}
-                            </button>
                         </div>
                     </div>
                 </div>
 
                 <div className="flex flex-col">
-                     <div className="bg-white rounded-lg shadow-lg flex-grow flex flex-col items-center p-4 sm:p-8">
+                     <div className="bg-white rounded-sm shadow-md flex-grow flex flex-col items-center p-4 sm:p-8">
                         <div className="w-full flex justify-between items-center mb-4 no-print">
-                            <h2 className="text-lg font-semibold">{`排版预览 (${totalPages}页 / ${finalNumColumns}栏)`}</h2>
+                            <h2 className="text-xl font-semibold">{`排版预览 (${totalPages}页 / ${finalNumColumns}栏)`}</h2>
                              <div className="flex items-center gap-2">
-                                <span className="text-sm text-slate-500">分栏:</span>
+                                <span className="text-sm text-black/60">分栏:</span>
                                 <select
                                     value={columnOption}
                                     onChange={(e) => setColumnOption(e.target.value as 'auto' | '1' | '2' | '3' | '4')}
-                                    className="text-sm border border-slate-300 rounded-md px-2 py-1 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    className="text-sm border border-neutral-300 rounded-sm px-2 py-1 bg-white focus:outline-none focus:ring-2 focus:ring-neutral-800 focus:border-neutral-800"
                                     aria-label="选择分栏数"
                                 >
                                     <option value="auto">自动</option>
@@ -373,28 +838,28 @@ const App: React.FC = () => {
                                     <option value="3">3栏</option>
                                     <option value="4">4栏</option>
                                 </select>
-                                <div className="w-px h-6 bg-slate-200 mx-2"></div>
-                                <span className="text-sm text-slate-500">字号:</span>
+                                <div className="w-px h-6 bg-neutral-200 mx-2"></div>
+                                <span className="text-sm text-black/60">字号:</span>
                                 <button
                                     onClick={() => adjustFontSize(-FONT_STEP)}
                                     disabled={!formattedHtml || isLoading || (finalFontSize && finalFontSize <= MIN_FONT_SIZE)}
-                                    className="w-7 h-7 flex items-center justify-center bg-slate-200 text-slate-700 font-bold rounded-md hover:bg-slate-300 disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed transition-colors"
+                                    className="w-7 h-7 flex items-center justify-center bg-neutral-200 text-black font-bold rounded-sm hover:bg-neutral-300 disabled:bg-neutral-100 disabled:text-black/40 disabled:cursor-not-allowed transition-colors"
                                     aria-label="减小字号"
                                 >-</button>
-                                <span className="text-sm font-medium text-slate-700 w-16 text-center tabular-nums">
+                                <span className="text-sm font-medium text-black w-16 text-center tabular-nums">
                                     {finalFontSize ? `${finalFontSize.toFixed(1)}pt` : '-'}
                                 </span>
                                 <button
                                     onClick={() => adjustFontSize(FONT_STEP)}
                                     disabled={!formattedHtml || isLoading || (finalFontSize && finalFontSize >= MAX_FONT_SIZE)}
-                                     className="w-7 h-7 flex items-center justify-center bg-slate-200 text-slate-700 font-bold rounded-md hover:bg-slate-300 disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed transition-colors"
+                                     className="w-7 h-7 flex items-center justify-center bg-neutral-200 text-black font-bold rounded-sm hover:bg-neutral-300 disabled:bg-neutral-100 disabled:text-black/40 disabled:cursor-not-allowed transition-colors"
                                     aria-label="增大字号"
                                 >+</button>
-                                <div className="w-px h-6 bg-slate-200 mx-2"></div>
+                                <div className="w-px h-6 bg-neutral-200 mx-2"></div>
                                 <button 
                                     onClick={handlePrint} 
                                     disabled={!formattedHtml || isLoading}
-                                    className="bg-slate-600 text-white font-bold py-1.5 px-4 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-offset-2 transition-colors duration-200 disabled:bg-slate-400 disabled:cursor-not-allowed text-sm"
+                                    className="bg-black text-white font-bold py-1.5 px-4 rounded-sm hover:bg-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-800 focus:ring-offset-2 transition-colors duration-200 disabled:bg-neutral-400 disabled:cursor-not-allowed text-sm"
                                 >
                                     打印
                                 </button>
@@ -423,7 +888,7 @@ const App: React.FC = () => {
                                                             transform: `translateY(${translateY}px)`,
                                                             width: `${columnWidth}px`
                                                         }}
-                                                        dangerouslySetInnerHTML={{ __html: formattedHtml || (overallColumnIndex === 0 ? '<p class="text-slate-400 pt-10">点击“智能排版”后，这里将显示预览。</p>' : '') }}
+                                                    dangerouslySetInnerHTML={{ __html: formattedHtml || (overallColumnIndex === 0 ? '<p class="text-black/40 pt-10">点击“智能排版”后，这里将显示预览。</p>' : '') }}
                                                     />
                                                 </div>
                                             );
