@@ -61,6 +61,30 @@ const DEFAULT_MARKDOWN = `# Markdown 页面适配器 (自动布局版)
 现在，请尝试粘贴您自己的内容！
 `;
 
+// 固定系统提示词（只读），用户的自定义指令将拼接在末尾 {{USER_CUSTOM_PROMPT}} 位置
+const BASE_SYSTEM_PROMPT = [
+'# 角色',
+'你是一个 Markdown 速查表生成器。你的唯一功能是将原始文本转换成一个简洁、结构清晰的 Markdown 速查表。你是一个文本处理引擎，而不是一个对话式AI。',
+'',
+'# 核心规则',
+'1.  **首要目标**：提取关键信息（如定义、公式、概念、定理），并将其格式化为一个干净的 Markdown 文档。',
+'',
+'2.  **格式化要求**：',
+'    - 使用 `#`、`##`、`###` 作为各级标题。',
+'    - 使用无序列表 (`- `) 来罗列要点。',
+'    - 使用粗体 (`**文字**`) 来强调关键词。',
+'    - 使用行内代码块 (`` `公式` ``) 来包裹所有公式、方程和代码，使其突出显示。',
+'',
+'3.  **严格输出协议**：',
+'    - **你的全部回答必须且只能是 Markdown 内容本身。**',
+'    - **禁止**输出任何引导性语句（例如，“这是您需要的速查表：”）。',
+'    - **禁止**输出任何总结性话语（例如，“希望这能帮到您。”）。',
+'    - 你输出的第一个字符必须是 Markdown 格式化字符（如 `#` 或 `-`），前面不能有任何文字或空格。',
+'',
+'# 用户的自定义指令',
+'{{USER_CUSTOM_PROMPT}}',
+].join('\\n');
+
 
 // --- SVG Icons ---
 const SpinnerIcon: React.FC<{ className?: string }> = ({ className }) => (
@@ -112,6 +136,10 @@ const App: React.FC = () => {
     const [aiGenerating, setAiGenerating] = useState<boolean>(false);
     const [aiMessage, setAiMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
     const [aiGenSuccess, setAiGenSuccess] = useState<boolean>(false);
+    // 自定义指令（仅用户部分，系统提示词固定）
+    const [aiUserPrompt, setAiUserPrompt] = useState<string>(() => localStorage.getItem('ai_user_prompt') || '');
+    const [isPromptModalOpen, setIsPromptModalOpen] = useState<boolean>(false);
+    const [promptDraft, setPromptDraft] = useState<string>(aiUserPrompt);
     
     const measurementRef = useRef<HTMLDivElement>(null);
 
@@ -164,6 +192,10 @@ const App: React.FC = () => {
             localStorage.setItem('ai_models', JSON.stringify(aiModels));
         } catch {}
     }, [aiModels]);
+    // 持久化自定义指令（仅用户部分）
+    useEffect(() => {
+        localStorage.setItem('ai_user_prompt', aiUserPrompt);
+    }, [aiUserPrompt]);
 
     // Ensure pdf.js worker
     const ensurePdfWorker = useCallback(() => {
@@ -420,7 +452,8 @@ const App: React.FC = () => {
         setAiGenSuccess(false);
         setAiMessage({ type: 'info', text: '正在生成知识点 Markdown...' });
         try {
-            const basePrompt = '你是一个严谨的中文助教。请从提供的材料（如课件、考试题）中提炼结构化知识点，要求：1) 主题-子主题层次清晰；2) 关键概念、定义、公式/代码、例题要点、易错点与对比；3) 给出适合速记的条目化要点；4) 输出严格使用中文 Markdown，以 # / ## / ### 标题组织，列表为 - 项，必要时用代码块与公式块；5) 末尾给出简短总结与复习建议；6) 禁止客套或模型自述。';
+            // 组装系统提示词 + 用户自定义指令 + 解析说明
+            const baseSystem = BASE_SYSTEM_PROMPT;
             const fileTypeLabel: Record<string, string> = { pdf: 'PDF', docx: 'DOCX', pptx: 'PPTX', md: 'Markdown', txt: 'TXT' };
             const typesIncluded = Array.from(new Set(aiFiles
                 .map(f => (f.name.split('.').pop()?.toLowerCase() || ''))
@@ -429,7 +462,8 @@ const App: React.FC = () => {
             const sourceNote = typesIncluded.length > 0
                 ? `注意：本次材料来自本地解析（包含：${typesIncluded.join(', ')}），可能存在格式/布局/公式渲染等细节丢失或换行错乱。请在总结时尽量修复明显格式问题，并对不确定处标注“可能不完整”。`
                 : `注意：材料主要来自纯文本输入。`;
-            const SYSTEM_PROMPT = `${basePrompt}\n\n${sourceNote}`;
+            const systemWithUser = baseSystem.replace('{{USER_CUSTOM_PROMPT}}', (aiUserPrompt?.trim() || '（无）'));
+            const SYSTEM_PROMPT = `${systemWithUser}\n\n（系统信息）解析说明：${sourceNote}`;
 
             const MAX_CHARS = 120000; // 简易阈值（按字符近似token）
             let finalMd = '';
@@ -485,7 +519,7 @@ const App: React.FC = () => {
         } finally {
             setAiGenerating(false);
         }
-    }, [aiSourceText, aiApiKey, aiSelectedModel, aiBaseUrl, callChatCompletions, aiFiles]);
+    }, [aiSourceText, aiApiKey, aiSelectedModel, aiBaseUrl, callChatCompletions, aiFiles, aiUserPrompt]);
 
     const handleFormat = useCallback(async () => {
         setIsLoading(true);
@@ -685,6 +719,12 @@ const App: React.FC = () => {
                     <div className="bg-white rounded-sm shadow-md mb-6">
                         <div className="p-4 border-b border-neutral-200 flex items-center justify-between">
                             <h2 className="text-xl font-semibold text-black">AI 知识点总结（OpenAI）</h2>
+                            <button
+                                onClick={() => { setPromptDraft(aiUserPrompt); setIsPromptModalOpen(true); }}
+                                className="bg-black text-white font-bold py-2 px-4 rounded-sm hover:bg-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-800 text-sm no-print"
+                            >
+                                自定义指令
+                            </button>
                         </div>
                         <div className="p-4 flex flex-col gap-4">
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -900,6 +940,56 @@ const App: React.FC = () => {
                      </div>
                 </div>
             </main>
+
+            {/* 自定义指令弹窗 */}
+            {isPromptModalOpen && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 no-print">
+                    <div className="bg-white rounded-sm shadow-lg w-full max-w-3xl p-4">
+                        <div className="flex items-center justify-between mb-3">
+                            <h3 className="text-lg font-semibold text-black">编辑自定义指令</h3>
+                            <button
+                                onClick={() => setIsPromptModalOpen(false)}
+                                className="text-black/60 hover:text-black text-sm"
+                                aria-label="关闭"
+                            >
+                                ✕
+                            </button>
+                        </div>
+                        <div className="space-y-3">
+                            <label className="block text-sm text-black/80 mb-1">用户的自定义指令</label>
+                            <textarea
+                                value={promptDraft}
+                                onChange={(e) => setPromptDraft(e.target.value)}
+                                className="w-full min-h-[220px] p-3 border border-neutral-300 rounded-sm text-sm leading-6 focus:outline-none focus:ring-2 focus:ring-neutral-800 focus:border-neutral-800"
+                                placeholder="请输入补充给模型的偏好/风格/结构要求（会与系统提示词合并发送）"
+                            />
+                            <p className="mt-2 text-xs text-black/60">
+                                说明：系统提示词不在界面展示，已内置。此处仅填写你额外的要求；保存后会本地持久化。
+                            </p>
+                        </div>
+                        <div className="mt-4 flex justify-end gap-2">
+                            <button
+                                onClick={() => setPromptDraft('')}
+                                className="px-3 py-2 text-sm bg-neutral-200 rounded-sm hover:bg-neutral-300"
+                            >
+                                清空
+                            </button>
+                            <button
+                                onClick={() => setIsPromptModalOpen(false)}
+                                className="px-3 py-2 text-sm bg-neutral-200 rounded-sm hover:bg-neutral-300"
+                            >
+                                取消
+                            </button>
+                            <button
+                                onClick={() => { setAiUserPrompt(promptDraft); setIsPromptModalOpen(false); }}
+                                className="px-4 py-2 text-sm bg-black text-white rounded-sm hover:bg-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-800"
+                            >
+                                保存
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 };
